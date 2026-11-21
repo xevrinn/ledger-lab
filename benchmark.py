@@ -6,15 +6,25 @@ from pathlib import Path
 from audit_env import SCENARIOS, run_policy
 
 POLICIES=("random","reconcile","flag_all","oracle")
+BALANCED_SCENARIOS=(
+    "clean", "clean", "clean", "clean", "clean",
+    "duplicate_invoice", "duplicate_invoice", "duplicate_invoice",
+    "payment_allocation", "payment_allocation",
+    "fx_rate_date", "fx_rate_date",
+    "period_cutoff", "period_cutoff", "period_cutoff",
+    "interacting_fx_allocation", "interacting_fx_allocation", "interacting_fx_allocation",
+    "interacting_cutoff_duplicate", "interacting_cutoff_duplicate",
+)
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--seeds',type=int,default=20)
     parser.add_argument('--out',default='artifacts/benchmark.json')
     parser.add_argument('--write-trajectories',action='store_true')
     args=parser.parse_args(); runs=[]; trajectories=[]
+    schedule = BALANCED_SCENARIOS if args.seeds == 20 else tuple(SCENARIOS[i%len(SCENARIOS)] for i in range(max(1,args.seeds)))
     for i in range(max(1,args.seeds)):
         # Same scenario and seed for each policy in a paired comparison.
-        seed=8400+i; scenario=SCENARIOS[i%len(SCENARIOS)]
+        seed=8400+i; scenario=schedule[i]
         for policy in POLICIES:
             result=run_policy(policy,seed,scenario)
             runs.append({'seed':seed,'scenario':scenario,'policy':policy,**result['metrics']})

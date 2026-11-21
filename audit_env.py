@@ -74,7 +74,7 @@ def generate_episode(seed: int, config: dict | None = None) -> tuple[dict, dict,
     invoices, payments, ledger, fx = [], [], [], []
     truth, provenance_changes = [], []
     invoice_by_id = {}
-    for i in range(8):
+    for i in range(75):
         inv_id = _id(rng, "INV")
         doc_id = _id(rng, "DOC")
         inv_day = start + timedelta(days=rng.randrange(max(1, (end-start).days)))
@@ -120,6 +120,13 @@ def generate_episode(seed: int, config: dict | None = None) -> tuple[dict, dict,
                             amount=_to_minor(invoice["total_minor"], invoice["currency"], base), currency=base, entity_id=entity_id,
                             invoice_id=invoice["invoice_id"], payment_id=pay_id))
 
+    # Balanced non-invoice journal activity gives episodes realistic inspection depth.
+    for _ in range(20):
+        misc_day = start + timedelta(days=rng.randrange(max(1, (end-start).days)))
+        misc_amount = rng.choice((12500, 27500, 48000, 48000, 125000))
+        ledger.extend(_pair(rng, timestamp=_iso(misc_day, offset), account="Operating adjustment",
+                            amount=misc_amount, currency=base, entity_id=entity_id))
+
     def add_issue(kind, affected, amount, currency, evidence, explanation):
         truth.append({"issue_id": _id(rng, "ISS"), "type": kind, "affected_ids": sorted(set(affected)),
                       "expected_amount_minor": amount, "currency": currency,
@@ -153,7 +160,7 @@ def generate_episode(seed: int, config: dict | None = None) -> tuple[dict, dict,
     def inject_fx():
         invoice = invoices[2]
         inv_day = date.fromisoformat(invoice["issued_at"][:10])
-        payment_day = min(end, inv_day + timedelta(days=7))
+        payment_day = inv_day + timedelta(days=7)
         currency = invoice["currency"]
         correct = _fx_rate(currency, base)
         wrong = correct * 1.08
@@ -361,52 +368,81 @@ def oracle_findings(truth):
 def run_policy(policy="oracle", seed=42, scenario=None, mode="open"):
     config={"mode":mode}
     if scenario: config["scenario"]=scenario
-    env=AuditEnv(); observation,_=env.reset(seed,config); trace=[]
-    if policy == "oracle":
-        findings=oracle_findings(env._truth)
-        action={"action":"submit","findings":findings}
+    env=AuditEnv(); observation,_=env.reset(seed,config); trace=[]; findings=[]
+    episode_id=observation["manifest"]["episode_id"]
+    def act(action):
         obs,reward,terminated,truncated,info=env.step(action)
-        trace.append({"episode_id":observation["manifest"]["episode_id"],"step":1,"action":action,"observation":obs,"reward":reward,"terminated":terminated,"truncated":truncated})
+        trace.append({"episode_id":episode_id,"step":len(trace)+1,"action":action,"observation":obs,
+                      "reward":reward,"terminated":terminated,"truncated":truncated})
+        return obs
+    def list_all(table):
+        rows=[]; cursor=0
+        while True:
+            page=act({"action":"list_records","table":table,"cursor":cursor,"limit":MAX_PAGE})
+            rows.extend(page.get("rows",[]))
+            next_cursor=page.get("cursor_next")
+            if next_cursor is None: break
+            cursor=next_cursor
+        return rows
+    if policy == "oracle":
+        # Evaluator-only ceiling: this adapter is intentionally outside the agent tool interface.
+        findings=oracle_findings(env._truth)
+        act({"action":"submit","findings":findings})
         metrics=score_findings(findings,env._truth,0)
     elif policy == "flag_all":
-        findings=[]
-        for kind in ERROR_TYPES:
-            rows=env.episode["tables"]["ledger"]
-            for row in rows:
-                findings.append({"type":kind,"affected_ids":[row["row_id"]],"claimed_amount_minor":row["debit_minor"] or row["credit_minor"],"currency":row["currency"],"evidence_ids":[row["row_id"]],"explanation":"Flag all baseline"})
-        findings=findings[:MAX_FINDINGS]
-        for table in TABLES:
-            action={"action":"list_records","table":table,"limit":MAX_PAGE}
-            obs,reward,terminated,truncated,info=env.step(action)
-            trace.append({"episode_id":observation["manifest"]["episode_id"],"step":len(trace)+1,"action":action,"observation":obs,"reward":reward,"terminated":terminated,"truncated":truncated})
-        action={"action":"submit","findings":findings};obs,reward,terminated,truncated,info=env.step(action)
-        trace.append({"episode_id":observation["manifest"]["episode_id"],"step":len(trace)+1,"action":action,"observation":obs,"reward":reward,"terminated":terminated,"truncated":truncated})
+        rows=list_all("ledger")
+        for row in rows[:MAX_FINDINGS]:
+            findings.append({"type":"period_cutoff","affected_ids":[row["row_id"]],
+                "claimed_amount_minor":row["debit_minor"] or row["credit_minor"],"currency":row["currency"],
+                "evidence_ids":[row["row_id"]],"explanation":"Flag-all attack baseline."})
+        act({"action":"submit","findings":findings})
         metrics=score_findings(findings,env._truth,env.inspection_steps)
     elif policy == "reconcile":
-        findings=[]
-        # Deliberately conservative: look for duplicated invoice identities and underallocated payments.
+        ledger=list_all("ledger"); invoices=list_all("invoices"); payments=list_all("payments"); fx=list_all("fx")
         inv_groups={}
-        for inv in env.episode["tables"]["invoices"]: inv_groups.setdefault(inv["invoice_id"],[]).append(inv)
+        for inv in invoices: inv_groups.setdefault(inv["invoice_id"],[]).append(inv)
         for inv_id, docs in inv_groups.items():
-            if len(docs)>1: findings.append({"type":"duplicate_invoice","affected_ids":[inv_id],"claimed_amount_minor":docs[0]["total_minor"],"currency":docs[0]["currency"],"evidence_ids":[d["doc_id"] for d in docs],"explanation":"Repeated invoice identity."})
-        inv_by={i["invoice_id"]:i for i in env.episode["tables"]["invoices"]}
-        for p in env.episode["tables"]["payments"]:
-            for ref in p["invoice_refs"]:
-                inv=inv_by.get(ref["invoice_id"])
-                if inv and ref["amount_minor"] < inv["total_minor"]:
-                    findings.append({"type":"payment_allocation","affected_ids":[p["payment_id"],inv["invoice_id"]],"claimed_amount_minor":inv["total_minor"]-ref["amount_minor"],"currency":inv["currency"],"evidence_ids":[p["doc_id"],inv["doc_id"]],"explanation":"Allocation does not cover invoice."})
-        for table in TABLES:
-            action={"action":"list_records","table":table,"limit":MAX_PAGE};obs,r,t,tr,info=env.step(action)
-            trace.append({"episode_id":observation["manifest"]["episode_id"],"step":len(trace)+1,"action":action,"observation":obs,"reward":r,"terminated":t,"truncated":tr})
-        action={"action":"submit","findings":findings};obs,reward,terminated,truncated,info=env.step(action)
-        trace.append({"episode_id":observation["manifest"]["episode_id"],"step":len(trace)+1,"action":action,"observation":obs,"reward":reward,"terminated":terminated,"truncated":truncated})
+            if len(docs)>1:
+                findings.append({"type":"duplicate_invoice","affected_ids":[inv_id],
+                    "claimed_amount_minor":docs[0]["total_minor"],"currency":docs[0]["currency"],
+                    "evidence_ids":[d["doc_id"] for d in docs],"explanation":"Repeated invoice identity across source documents."})
+        inv_by={i["invoice_id"]:i for i in invoices}
+        for payment in payments:
+            refs=payment.get("invoice_refs",[])
+            allocated=sum(int(ref.get("amount_minor",0)) for ref in refs)
+            unallocated=int(payment.get("amount_minor",0))-allocated
+            if unallocated>0 and len(refs)==1:
+                inv=inv_by.get(refs[0].get("invoice_id"))
+                if inv:
+                    findings.append({"type":"payment_allocation","affected_ids":[payment["payment_id"],inv["invoice_id"]],
+                        "claimed_amount_minor":unallocated,"currency":payment["currency"],
+                        "evidence_ids":[payment["doc_id"],inv["doc_id"]],"explanation":"Payment total exceeds the amount allocated to its invoice."})
+        manifest=env.episode["manifest"]; policy_doc=env.episode["policy"]
+        fx_by_date={(x["date"],x["source_currency"],x["target_currency"]):float(x["rate"]) for x in fx}
+        for inv in invoices:
+            issue_date=inv["issued_at"][:10]
+            postings=[r for r in ledger if r.get("invoice_id")==inv["invoice_id"] and r.get("account")=="Operating expense"]
+            for row in postings:
+                if issue_date>=manifest["period_start"] and issue_date<=manifest["period_end"] and row["timestamp"][:10]>manifest["period_end"]:
+                    findings.append({"type":"period_cutoff","affected_ids":[inv["invoice_id"],row["row_id"]],
+                        "claimed_amount_minor":row["debit_minor"],"currency":manifest["base_currency"],
+                        "evidence_ids":[inv["doc_id"],row["row_id"]],"explanation":"In-period invoice is posted after the reporting cutoff."})
+                if inv["currency"]!=manifest["base_currency"]:
+                    rate=fx_by_date.get((issue_date,inv["currency"],manifest["base_currency"]))
+                    if rate is None: continue
+                    expected=round((inv["total_minor"]/(10**CURRENCIES[inv["currency"]]))*rate*(10**CURRENCIES[manifest["base_currency"]]))
+                    delta=abs(int(row["debit_minor"])-expected)
+                    if delta>1:
+                        findings.append({"type":"fx_rate_date","affected_ids":[inv["invoice_id"],row["row_id"]],
+                            "claimed_amount_minor":delta,"currency":manifest["base_currency"],
+                            "evidence_ids":[inv["doc_id"],row["row_id"]],"explanation":"Posted base amount differs from the policy invoice-date conversion."})
+        act({"action":"submit","findings":findings})
         metrics=score_findings(findings,env._truth,env.inspection_steps)
     else:
         # Fixed-seed random explorer is deterministic and abstains at submit.
         for table in ("ledger","invoices","payments"):
-            action={"action":"list_records","table":table,"limit":8};obs,r,t,tr,info=env.step(action)
-            trace.append({"episode_id":observation["manifest"]["episode_id"],"step":len(trace)+1,"action":action,"observation":obs,"reward":r,"terminated":t,"truncated":tr})
-        action={"action":"submit","findings":[]};obs,reward,terminated,truncated,info=env.step(action)
-        trace.append({"episode_id":observation["manifest"]["episode_id"],"step":len(trace)+1,"action":action,"observation":obs,"reward":reward,"terminated":terminated,"truncated":truncated})
+            act({"action":"list_records","table":table,"limit":8})
+        act({"action":"submit","findings":[]})
         metrics=score_findings([],env._truth,env.inspection_steps)
-    return {"metrics":metrics,"trace":trace,"episode":env.episode,"truth":env._truth,"provenance":env._provenance,"findings":findings}
+    return {"metrics":metrics,"trace":trace,"episode":env.episode,"truth":env._truth,
+            "provenance":env._provenance,"findings":findings}

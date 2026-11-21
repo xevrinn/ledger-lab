@@ -3,6 +3,6 @@
   "environment_version": "0.3.0",
   "train_episodes": 10,
   "dev_episodes": 10,
-  "trajectory_count": 100,
+  "trajectory_count": 200,
   "note": "All records are synthetic. truth/provenance files are evaluator-side and never returned by AuditEnv.step."
 }
