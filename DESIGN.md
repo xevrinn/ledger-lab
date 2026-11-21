@@ -1,0 +1,15 @@
+# Ledger Lab — design note
+
+**Audience.** Teams evaluating an AI auditor with a repeatable, offline tool environment. The product is the environment and evaluator, not an accounting service or a model.
+
+**Visual system.** The interface borrows from a forensic lab console: near-black paper, acid-lime instrument lights, restrained evidence colors, mono labels, and oversized technical display typography. The interface keeps the evidence room and scorecard in fixed positions so reviewers can compare source material, claims, and outcomes without losing context. Orange/red is reserved for guardrails and anomaly classes; color alone never conveys correctness.
+
+**Episode lifecycle.** `AuditEnv.reset(seed, config)` creates a deterministic synthetic company and returns only the task, manifest, accounting policy, budget, and action names. `step(action)` exposes paginated read-only records, document lookups, a restricted arithmetic calculator, or a terminal submission. The seed and evaluator references are not in the observation. Closed mode returns zero for exploration and submission, withholds diagnostic metrics from `observation` and `info`, and exposes evaluation data only through the evaluator-only method after termination. The local HTTP server does not serialize evaluator objects.
+
+**Data and anomaly provenance.** Each generated company starts from paired synthetic journal lines and source documents. Error injectors record the changed IDs and cause in a separate provenance object. Supported anomaly families are duplicate invoice identity, underallocated payment, exchange-rate date mismatch, and reporting-period cutoff. Two paired interactions are included. Clean books contain same-value invoices and split payments as plausible distractors. The included datasets are open train/dev examples; their reference files are separate from agent observations.
+
+**Matcher.** A finding is eligible for one-to-one matching only when issue type, sorted unique affected IDs, currency, amount within one minor unit, and a complete allowed evidence set match. A maximum bipartite matching prevents duplicate findings from earning additional true positives. `precision`, `recall`, `F1`, and `clip(2*F1 - 1 - 0.002*inspection_steps, -1, 1)` are computed from those matches. Prose does not affect the reward.
+
+**Baseline adapters.** `random` performs fixed deterministic inspection and abstains; `reconcile` checks duplicate invoice IDs and invoice/payment allocation; `flag_all` generates unsupported claims as an attack baseline; `oracle` is evaluator-only and submits generated reference findings. The benchmark pairs all four on the same seed/scenario and labels oracle as a ceiling.
+
+**Limitations.** Synthetic records do not represent real companies or professional audit advice. The baseline is intentionally incomplete. The browser hosted on GitHub Pages is an open visual demo and stores no episode data server-side; run `python server.py` or the Python API directly for the actual environment. No model training or model-quality improvement is claimed.
